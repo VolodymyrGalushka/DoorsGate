@@ -1,15 +1,14 @@
 #include "main.h"
-
+#include <LittleFS.h>
 #include <Arduino.h>
 #include <ESP8266WiFi.h>          //https://github.com/esp8266/Arduino
 #include <BlynkSimpleEsp8266.h>
-
-//needed for library
 #include <DNSServer.h>
 #include <ESP8266WebServer.h>
 #include <WiFiManager.h>         //https://github.com/tzapu/WiFiManager
-
 #include <NTPClient.h>
+#include <ArduinoJson.h>
+
 
 char auth[] = "AEVP1i4PpaT6vapjw4Gz0mNRg5kawk-X";
 
@@ -24,12 +23,16 @@ WiFiUDP*            ntpUDP = nullptr;
 TriggerSettings     ts;
 bool                sensor_active{true};
 
+
+//-----------------------------------------------------------------------------------------------------------
 void setup() 
 {
     // put your setup code here, to run once:
     Serial.begin(115200);
 
     pinMode(relay_switch_pin, OUTPUT);
+
+    load_trigger_settings();
 
     //WiFiManager
     //Local intialization. Once its business is done, there is no need to keep it around
@@ -55,9 +58,13 @@ void setup()
     timeClient->setTimeOffset(7*60*60);
     //timeClient->setUpdateInterval(1000*60);
 
+    
+
     Blynk.config(auth);
 }
 
+
+//-----------------------------------------------------------------------------------------------------------
 void loop() 
 {
     if(millis() - last_update > update_time_interval)
@@ -72,7 +79,7 @@ void loop()
     //process start
     if(ts.start_trigger_on)
     {
-      if(ts.all_week || ts.week_days[timeClient->getDay()])
+      if(ts.week_days[timeClient->getDay()])
       {
         if(ts.start_hour == timeClient->getHours())
         {
@@ -91,7 +98,7 @@ void loop()
     //process stop
     if(ts.stop_trigger_on)
     {
-      if(ts.all_week || ts.week_days[timeClient->getDay()])
+      if(ts.week_days[timeClient->getDay()])
       {
         if(ts.stop_hour == timeClient->getHours())
         {
@@ -114,6 +121,8 @@ void loop()
     
 }
 
+
+//-----------------------------------------------------------------------------------------------------------
 BLYNK_WRITE(V1) 
 {
   TimeInputParam t(param);
@@ -178,17 +187,98 @@ BLYNK_WRITE(V1)
     }
   }
 
-  ts.all_week = (days_off_count == 7) ? true : false;
-  
+  ts.start_trigger_on = (days_off_count == 7) ? false : true;
+  ts.stop_trigger_on = (days_off_count == 7) ? false : true;
+
+  save_trigger_settings();
   
   Serial.println();
 }
 
 
+//-----------------------------------------------------------------------------------------------------------
 BLYNK_WRITE(V2)
 {
     int state = param.asInt();
     digitalWrite(relay_switch_pin, state);
     sensor_active = (state) ? true : false;
     Serial.printf("Manual activation: %d", state);
+}
+
+
+//-----------------------------------------------------------------------------------------------------------
+void save_trigger_settings() 
+{
+    DynamicJsonDocument doc(2048);
+    JsonObject obj = doc.to<JsonObject>();
+    obj["start_hour"] = ts.start_hour;
+    obj["start_minute"] = ts.start_minute;
+    obj["stop_hour"] = ts.stop_hour;
+    obj["stop_minute"] = ts.stop_minute;
+    obj["start_trigger_on"] = static_cast<int>(ts.start_trigger_on);
+    obj["stop_trigger_on"] = static_cast<int>(ts.stop_trigger_on);
+    auto week_array = doc.createNestedArray("week");
+    Serial.println("Serializing week");
+    for(auto i = 0; i < 7; i++)
+    {
+      week_array.add(ts.week_days[i]);
+    }
+    Serial.println("Week serialized");
+    LittleFS.begin();
+    Serial.println("Opening file");
+    File settings_file = LittleFS.open("trigger_settings.json", "w");
+    Serial.println("Serializing json");
+    serializeJson(doc, settings_file);
+    Serial.println("Ending...");
+    LittleFS.end();
+}
+
+
+//-----------------------------------------------------------------------------------------------------------
+void load_trigger_settings() 
+{
+    DynamicJsonDocument doc(2048);
+    LittleFS.begin();
+    File settings_file = LittleFS.open("trigger_settings.json", "r");
+    auto err = deserializeJson(doc, settings_file);
+    switch (err.code()) 
+    {
+        case DeserializationError::Ok:
+            Serial.println("Deserialization succeeded");
+            break;
+        case DeserializationError::InvalidInput:
+            Serial.println("Invalid input!");
+            break;
+        case DeserializationError::NoMemory:
+            Serial.println("Not enough memory");
+            break;
+        default:
+            Serial.println("Deserialization failed");
+            break;
+    }
+    LittleFS.end();
+
+    ts.start_hour = doc["start_hour"];
+    ts.start_minute = doc["start_minute"];
+    ts.stop_hour = doc["stop_hour"];
+    ts.stop_minute = doc["stop_minute"];
+    ts.start_trigger_on = static_cast<bool>(doc["start_trigger_on"]);
+    ts.stop_trigger_on = static_cast<bool>(doc["stop_trigger_on"]);
+    
+
+    uint8_t i = 0;
+    for(JsonVariant day : doc["week"].as<JsonArray>())
+    {
+      ts.week_days[i] = day.as<bool>();
+      i++;
+    }
+
+    Serial.println("Loaded settings.");
+    Serial.printf("Start: %d:%d. Stop: %d:%d\n", ts.start_hour, ts.start_minute, ts.stop_hour, ts.stop_minute);
+    Serial.printf("Start_trig - %d, Stop_trig - %d\n", ts.start_trigger_on, ts.stop_trigger_on);
+    for(auto i = 0; i < 7; i++)
+    {
+      Serial.printf("Day: %d = %d\n", i, ts.week_days[i]);
+    }
+    Serial.println();
 }
