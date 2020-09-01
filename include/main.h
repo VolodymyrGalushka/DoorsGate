@@ -8,14 +8,16 @@ struct TriggerSettings
     int     start_minute;
     int     stop_hour;
     int     stop_minute;
-    bool    start_trigger_on{true};
-    bool    stop_trigger_on{true};
+    bool    trigger_on{true};
     bool    week_days[7];
 };
 
 
 void    save_trigger_settings();
 void    load_trigger_settings();
+bool    should_open_advanced();
+bool    should_open();
+void    reset_state();
 
 
 #endif // __MAIN_H__

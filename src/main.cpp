@@ -1,5 +1,5 @@
 #include "main.h"
-#include <LittleFS.h>
+#include <FS.h>
 #include <Arduino.h>
 #include <ESP8266WiFi.h>          //https://github.com/esp8266/Arduino
 #include <BlynkSimpleEsp8266.h>
@@ -21,8 +21,8 @@ NTPClient*          timeClient = nullptr;
 WiFiUDP*            ntpUDP = nullptr;
 
 TriggerSettings     ts;
-bool                sensor_active{true};
-
+bool                sensor_active{false};
+bool                manually_switched{false};
 
 //-----------------------------------------------------------------------------------------------------------
 void setup() 
@@ -50,15 +50,14 @@ void setup()
     wifiManager.autoConnect("Dooooors");
     
     //if you get here you have connected to the WiFi
-    Serial.println("connected...yeey :)");
+    Serial.println("Wifi connected...");
 
     ntpUDP = new WiFiUDP();
     timeClient = new NTPClient(*ntpUDP);
     timeClient->begin();
     timeClient->setTimeOffset(7*60*60);
+    timeClient->forceUpdate();
     //timeClient->setUpdateInterval(1000*60);
-
-    
 
     Blynk.config(auth);
 }
@@ -74,60 +73,63 @@ void loop()
       Serial.println("Time synced!");
     }
     
-    Serial.println(timeClient->getFormattedTime());
+    Serial.printf("Hour: %d, minute: %d\n", timeClient->getHours(), timeClient->getMinutes());
+    Serial.printf("Day: %d\n", timeClient->getDay());
 
     //process start
-    if(ts.start_trigger_on)
+    if(ts.trigger_on)
     {
-      if(ts.week_days[timeClient->getDay()])
+      if(should_open())
       {
-        if(ts.start_hour == timeClient->getHours())
+        if(!sensor_active && !manually_switched)
         {
-          if(ts.start_minute == timeClient->getMinutes())
-          {
-              if(!sensor_active)
-              {
-                  digitalWrite(relay_switch_pin, HIGH);
-                  sensor_active = true;
-              }
-          }
+            digitalWrite(relay_switch_pin, HIGH);
+            sensor_active = true;
+            Blynk.virtualWrite(V2, static_cast<int>(sensor_active)); //todo update on timer
         }
       }
-    }
-
-    //process stop
-    if(ts.stop_trigger_on)
-    {
-      if(ts.week_days[timeClient->getDay()])
+      else
       {
-        if(ts.stop_hour == timeClient->getHours())
-        {
-          if(ts.stop_minute == timeClient->getMinutes())
+        if(sensor_active && !manually_switched)
           {
-              if(sensor_active)
-              {
-                  digitalWrite(relay_switch_pin, LOW);
-                  sensor_active = false;
-              }
+              digitalWrite(relay_switch_pin, LOW);
+              sensor_active = false;
+              Blynk.virtualWrite(V2, static_cast<int>(sensor_active)); //todo update on timer
           }
-        }
       }
     }
 
     Blynk.run();
 
-    delay(5000);
+    delay(1000);
     // put your main code here, to run repeatedly:
     
 }
 
 
 //-----------------------------------------------------------------------------------------------------------
+BLYNK_CONNECTED()
+{
+    Blynk.virtualWrite(V2, static_cast<int>(sensor_active));
+    Blynk.syncAll();
+}
+
+//-----------------------------------------------------------------------------------------------------------
 BLYNK_WRITE(V1) 
 {
   TimeInputParam t(param);
 
-  // Process start time
+  if(t.hasStartTime() && t.hasStopTime())
+  {
+      ts.trigger_on = true;
+  }
+  else
+  {
+      ts.trigger_on = false;
+      save_trigger_settings();
+      reset_state();
+      return;
+  }
 
   if (t.hasStartTime())
   {
@@ -137,12 +139,6 @@ BLYNK_WRITE(V1)
                    t.getStartSecond());
     ts.start_hour = t.getStartHour();
     ts.start_minute = t.getStartMinute();
-    ts.start_trigger_on = true;
-  }
-  else
-  {
-    //turn off start trigger;
-    ts.start_trigger_on = false;
   }
 
   // Process stop time
@@ -155,12 +151,6 @@ BLYNK_WRITE(V1)
                    t.getStopSecond());
     ts.stop_hour = t.getStopHour();
     ts.stop_minute = t.getStopMinute();
-    ts.stop_trigger_on = true;
-  }
-  else
-  {
-      //turn off stop strigger
-    ts.stop_trigger_on = false;
   }
 
   // Process timezone
@@ -187,10 +177,11 @@ BLYNK_WRITE(V1)
     }
   }
 
-  ts.start_trigger_on = (days_off_count == 7) ? false : true;
-  ts.stop_trigger_on = (days_off_count == 7) ? false : true;
+  ts.trigger_on = (days_off_count == 7) ? false : true;
 
   save_trigger_settings();
+
+  reset_state();
   
   Serial.println();
 }
@@ -201,8 +192,16 @@ BLYNK_WRITE(V2)
 {
     int state = param.asInt();
     digitalWrite(relay_switch_pin, state);
+    if(should_open())
+    {
+      manually_switched = (state == LOW) ? true : false;
+    }
+    else
+    {
+      manually_switched = (state == HIGH) ? true : false;
+    }
+    Serial.printf("Manually switched: %d\n", manually_switched);
     sensor_active = (state) ? true : false;
-    Serial.printf("Manual activation: %d", state);
 }
 
 
@@ -215,8 +214,7 @@ void save_trigger_settings()
     obj["start_minute"] = ts.start_minute;
     obj["stop_hour"] = ts.stop_hour;
     obj["stop_minute"] = ts.stop_minute;
-    obj["start_trigger_on"] = static_cast<int>(ts.start_trigger_on);
-    obj["stop_trigger_on"] = static_cast<int>(ts.stop_trigger_on);
+    obj["trigger_on"] = static_cast<int>(ts.trigger_on);
     auto week_array = doc.createNestedArray("week");
     Serial.println("Serializing week");
     for(auto i = 0; i < 7; i++)
@@ -224,13 +222,13 @@ void save_trigger_settings()
       week_array.add(ts.week_days[i]);
     }
     Serial.println("Week serialized");
-    LittleFS.begin();
+    SPIFFS.begin();
     Serial.println("Opening file");
-    File settings_file = LittleFS.open("trigger_settings.json", "w");
+    File settings_file = SPIFFS.open("trigger_settings.json", "w");
     Serial.println("Serializing json");
     serializeJson(doc, settings_file);
     Serial.println("Ending...");
-    LittleFS.end();
+    SPIFFS.end();
 }
 
 
@@ -238,8 +236,8 @@ void save_trigger_settings()
 void load_trigger_settings() 
 {
     DynamicJsonDocument doc(2048);
-    LittleFS.begin();
-    File settings_file = LittleFS.open("trigger_settings.json", "r");
+    SPIFFS.begin();
+    File settings_file = SPIFFS.open("trigger_settings.json", "r");
     auto err = deserializeJson(doc, settings_file);
     switch (err.code()) 
     {
@@ -256,15 +254,13 @@ void load_trigger_settings()
             Serial.println("Deserialization failed");
             break;
     }
-    LittleFS.end();
+    SPIFFS.end();
 
     ts.start_hour = doc["start_hour"];
     ts.start_minute = doc["start_minute"];
     ts.stop_hour = doc["stop_hour"];
     ts.stop_minute = doc["stop_minute"];
-    ts.start_trigger_on = static_cast<bool>(doc["start_trigger_on"]);
-    ts.stop_trigger_on = static_cast<bool>(doc["stop_trigger_on"]);
-    
+    ts.trigger_on = static_cast<bool>(doc["trigger_on"]);    
 
     uint8_t i = 0;
     for(JsonVariant day : doc["week"].as<JsonArray>())
@@ -275,10 +271,83 @@ void load_trigger_settings()
 
     Serial.println("Loaded settings.");
     Serial.printf("Start: %d:%d. Stop: %d:%d\n", ts.start_hour, ts.start_minute, ts.stop_hour, ts.stop_minute);
-    Serial.printf("Start_trig - %d, Stop_trig - %d\n", ts.start_trigger_on, ts.stop_trigger_on);
+    Serial.printf("Trigger_active - %d\n", ts.trigger_on);
     for(auto i = 0; i < 7; i++)
     {
       Serial.printf("Day: %d = %d\n", i, ts.week_days[i]);
     }
     Serial.println();
+}
+
+
+//-----------------------------------------------------------------------------------------------------------
+bool should_open()
+{
+    auto current_hour = timeClient->getHours();
+    auto current_minute = timeClient->getMinutes();
+    auto till_start = ts.start_hour*60 + ts.start_minute;
+    auto till_now = current_hour*60 + current_minute;
+    auto till_stop = ts.stop_hour*60 + ts.stop_minute;
+
+    if(ts.week_days[timeClient->getDay()])
+    {
+      if(till_stop > till_start)
+      {
+          if(till_now >= till_start && till_now < till_stop)
+            return true;
+          else
+            return false;
+      }
+      else
+      {
+          return false;
+      }
+    }
+    else
+    {
+      return false;
+    }
+}
+
+
+//-----------------------------------------------------------------------------------------------------------
+void reset_state() 
+{
+      manually_switched = false;
+      digitalWrite(relay_switch_pin, LOW);
+      sensor_active = false;
+      Blynk.virtualWrite(V2, static_cast<int>(sensor_active));
+}
+
+
+//-----------------------------------------------------------------------------------------------------------
+bool should_open_advanced() 
+{
+    auto current_hour = timeClient->getHours();
+    auto current_minute = timeClient->getMinutes();
+    auto till_start = ts.start_hour*60 + ts.start_minute;
+    auto till_now = current_hour*60 + current_minute;
+    auto till_stop = ts.stop_hour*60 + ts.stop_minute;
+
+    if(ts.week_days[timeClient->getDay()])
+    {
+      if(till_stop < till_start)
+      {   
+          if(till_now >= till_stop && till_now < till_start)
+            return false;
+          else
+            return true;
+      }
+      else if(till_stop > till_start)
+      {
+          if(till_now >= till_start && till_now < till_stop)
+            return true;
+          else
+            return false;
+      }
+    }
+    else
+    {
+      return false;
+    }
 }
